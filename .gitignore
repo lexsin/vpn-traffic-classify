@@ -1,0 +1,10 @@
+# This repository contains only the vpnflow source tree and project metadata.
+*
+!.gitignore
+!README.md
+!vpnflow/
+!vpnflow/**
+
+# Derived data and local build artifacts
+/vpnflow/out/
+/vpnflow/.gocache/
