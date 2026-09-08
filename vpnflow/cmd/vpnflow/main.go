@@ -70,6 +70,19 @@ func inferLabel(path string) string {
 	return ""
 }
 
+// resolveExtractionLabel 决定是否为一个 PCAP 提取 ML 特征。
+// 推理模式允许 label 为空；训练模式继续保持原有的文件名/目录名推断规则。
+func resolveExtractionLabel(path, override string, inference bool) (string, bool) {
+	if override != "" {
+		return override, true
+	}
+	if inference {
+		return "", true
+	}
+	inferred := inferLabel(path)
+	return inferred, inferred != ""
+}
+
 func main() {
 	pcapPath := flag.String("pcap", "", "PCAP 文件或目录（必填）")
 	outPath := flag.String("output", "", "输出 CSV 路径（必填）")
@@ -84,6 +97,7 @@ func main() {
 	protocolOut := flag.String("protocol-output", "", "标准协议会话 JSONL 输出路径；为空时不写文件")
 	protocolIdleTimeout := flag.Duration("protocol-idle-timeout", 120*time.Second, "标准协议 Flow/Session 空闲超时")
 	protocolOnly := flag.Bool("protocol-only", false, "只运行标准协议规则分支，不做 TCP 重组和 ML 特征提取")
+	inference := flag.Bool("inference", false, "未标注 PCAP 推理模式：即使无法推断 label 也生成 ML 特征")
 	flag.Parse()
 
 	if *pcapPath == "" || (!*protocolOnly && *outPath == "") ||
@@ -131,14 +145,11 @@ func main() {
 
 	for _, pcapFile := range pcapFiles {
 		filename := filepath.Base(pcapFile)
-		fl := *label
-		if fl == "" {
-			fl = inferLabel(pcapFile)
-		}
-		if fl == "" && !*protocolOnly {
+		fl, extractionEnabled := resolveExtractionLabel(pcapFile, *label, *inference)
+		if !extractionEnabled && !*protocolOnly {
 			log.Printf("[警告] %s 无法推断 label：仍执行标准协议识别，但不生成该文件的 ML 特征", filename)
 		}
-		mlEnabled := !*protocolOnly && fl != ""
+		mlEnabled := !*protocolOnly && extractionEnabled
 
 		t0 := time.Now()
 		packets, err := pcapreader.ReadPackets(pcapFile)
@@ -227,8 +238,12 @@ func main() {
 			fileKept++
 			keptFlows++
 		}
+		displayLabel := fl
+		if displayLabel == "" {
+			displayLabel = "<inference>"
+		}
 		fmt.Printf("[过滤] %s: %d 条流 → %d 条典型候选 → %d 条保留 (label=%s, tcp握手排除=%d, ClientHello排除=%d), 耗时 %v\n",
-			filename, len(flows), fileTypical, fileKept, fl, fileHandshakeDropped, fileClientHelloDropped, time.Since(t0))
+			filename, len(flows), fileTypical, fileKept, displayLabel, fileHandshakeDropped, fileClientHelloDropped, time.Since(t0))
 		if *requirePostTLSPayload {
 			fmt.Printf("[过滤] %s: 后TLS载荷窗口排除=%d\n", filename, filePostTLSPayloadDropped)
 		}

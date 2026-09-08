@@ -50,3 +50,27 @@ func TestInferLabelByParentDir(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveExtractionLabelInference(t *testing.T) {
+	label, enabled := resolveExtractionLabel(filepath.Join("captures", "unknown.pcap"), "", true)
+	if !enabled {
+		t.Fatal("inference mode must enable ML feature extraction")
+	}
+	if label != "" {
+		t.Fatalf("inference label=%q, want empty", label)
+	}
+}
+
+func TestResolveExtractionLabelTrainingUnknown(t *testing.T) {
+	label, enabled := resolveExtractionLabel(filepath.Join("captures", "unknown.pcap"), "", false)
+	if enabled || label != "" {
+		t.Fatalf("training unknown got label=%q enabled=%v, want empty/false", label, enabled)
+	}
+}
+
+func TestResolveExtractionLabelOverride(t *testing.T) {
+	label, enabled := resolveExtractionLabel("unknown.pcap", "trojan", true)
+	if !enabled || label != "trojan" {
+		t.Fatalf("override got label=%q enabled=%v", label, enabled)
+	}
+}

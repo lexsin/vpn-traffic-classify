@@ -8,3 +8,5 @@
 # Derived data and local build artifacts
 /vpnflow/out/
 /vpnflow/.gocache/
+/vpnflow/**/__pycache__/
+/vpnflow/**/*.pyc
