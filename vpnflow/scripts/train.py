@@ -117,9 +117,29 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--csv', default='/home/lixiao/vpn/features4.csv')
     ap.add_argument('--out', default='/home/lixiao/vpn/reports/train_report.txt')
+    ap.add_argument(
+        '--allow-missing-post-tls',
+        action='store_true',
+        help='允许后 TLS 载荷不可用的流进入 Trojan 模型（仅用于对照实验）',
+    )
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
+    total_before_gate = len(df)
+    if not args.allow_missing_post_tls:
+        gate_col = (
+            'trojan_applicable'
+            if 'trojan_applicable' in df.columns
+            else 'post_tls_payload_ready'
+        )
+        if gate_col not in df.columns:
+            raise ValueError(
+                'CSV 缺少 trojan_applicable/post_tls_payload_ready；'
+                '请使用新版 vpnflow 重新提取特征'
+            )
+        df = df[df[gate_col].fillna(0).astype(int) == 1].copy()
+        if df.empty:
+            raise ValueError('Trojan applicability 门控后没有可训练样本')
     df['y'] = (df['label'] == 'trojan').astype(int)
 
     lines = []
@@ -130,6 +150,11 @@ def main():
     p('=' * 72)
     p('Phase 5 训练报告 — Trojan vs Clean 二分类')
     p('=' * 72)
+    p(
+        f'Trojan applicability gate: '
+        f'{"disabled" if args.allow_missing_post_tls else "enabled"}, '
+        f'kept={len(df)}/{total_before_gate}'
+    )
     p(f'总样本: {len(df)} 流, trojan={df["y"].sum()}, clean={(df["y"]==0).sum()}')
     p('\n按 source 分布:')
     for s, g in df.groupby('source_file'):

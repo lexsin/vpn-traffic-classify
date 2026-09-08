@@ -360,6 +360,32 @@ func Extract(flow *model.Flow, sourceFile, label string) model.FeatureRow {
 	r.InnerOffsetValue = off
 	r.InnerOffsetValid = valid
 
+	postTLSRecords := postTLSPayloadRecords(flow)
+	r.PostTLSActualAppDataCount = len(postTLSRecords)
+	if len(postTLSRecords) >= postTLSPayloadMinRecords {
+		r.PostTLSPayloadReady = 1
+		r.TrojanApplicable = 1
+	}
+	for i := 0; i < 10 && i < len(postTLSRecords); i++ {
+		rec := postTLSRecords[i]
+		r.PostTLSAppDataLen[i] = int(rec.RecordLength)
+		if rec.Direction == model.DirectionUplink {
+			r.PostTLSAppDataDir[i] = 1
+		} else {
+			r.PostTLSAppDataDir[i] = -1
+		}
+		if i == 0 {
+			r.PostTLSAppDataIAT[i] = 0
+		} else {
+			d := rec.Timestamp.Sub(postTLSRecords[i-1].Timestamp).Seconds()
+			if d < 0 {
+				d = 0
+			}
+			r.PostTLSAppDataIAT[i] = d
+		}
+	}
+	// 从后 TLS 载荷首条 AppData 所在的 TCP 包开始，重算完整 shape_sequence。
+	r.PostTLSShape = buildPacketShape(postTLSPayloadPackets(flow, postTLSRecords))
 	// —— Phase 2: 前 10 包序列 ——
 	r.ActualPktCount = n
 	for i := 0; i < 10 && i < n; i++ {

@@ -19,14 +19,15 @@ type dataset struct {
 }
 
 type readOptions struct {
-	minPackets          int
-	minDuration         float64
-	minPayloadBytes     int
-	minPayloadPkts      int
-	requireBidi         bool
-	requireClientHello  bool
-	requireTCPHandshake bool
-	positiveLabel       string
+	minPackets            int
+	minDuration           float64
+	minPayloadBytes       int
+	minPayloadPkts        int
+	requireBidi           bool
+	requireClientHello    bool
+	requirePostTLSPayload bool
+	requireTCPHandshake   bool
+	positiveLabel         string
 }
 
 type metrics struct {
@@ -58,6 +59,7 @@ func main() {
 	minPayloadPkts := flag.Int("min-train-payload-pkts", 3, "training-side minimum packets with payload, estimated from zero_payload_ratio")
 	requireBidi := flag.Bool("train-require-bidi", true, "training-side require bidirectional packet counts")
 	requireClientHello := flag.Bool("train-require-client-hello", false, "training/scoring-side require a parsed TLS ClientHello")
+	requirePostTLSPayload := flag.Bool("train-require-post-tls-payload", false, "training/scoring-side require at least 3 records after the outer TLS handshake")
 	requireTCPHandshake := flag.Bool("train-require-tcp-handshake", false, "training/scoring-side require a validated TCP three-way handshake")
 	threshold := flag.Float64("threshold", 0.6, "positive-class probability threshold used for metrics and per-flow predictions")
 	flag.Parse()
@@ -67,14 +69,15 @@ func main() {
 	decisionThreshold = *threshold
 
 	opts := readOptions{
-		minPackets:          *minPackets,
-		minDuration:         *minDuration,
-		minPayloadBytes:     *minPayloadBytes,
-		minPayloadPkts:      *minPayloadPkts,
-		requireBidi:         *requireBidi,
-		requireClientHello:  *requireClientHello,
-		requireTCPHandshake: *requireTCPHandshake,
-		positiveLabel:       *positiveLabel,
+		minPackets:            *minPackets,
+		minDuration:           *minDuration,
+		minPayloadBytes:       *minPayloadBytes,
+		minPayloadPkts:        *minPayloadPkts,
+		requireBidi:           *requireBidi,
+		requireClientHello:    *requireClientHello,
+		requirePostTLSPayload: *requirePostTLSPayload,
+		requireTCPHandshake:   *requireTCPHandshake,
+		positiveLabel:         *positiveLabel,
 	}
 
 	ds, err := readDataset(*csvPath, opts)
@@ -85,7 +88,16 @@ func main() {
 	sets := featureSets(ds.header)
 	selectedCols, ok := sets[*modelFeatureSet]
 	if !ok {
-		fatal(fmt.Errorf("unknown model-feature-set %q; choose shape_core, shape_sequence, or protocol_no_ids", *modelFeatureSet))
+		fatal(fmt.Errorf("unknown model-feature-set %q; choose shape_core, shape_sequence, protocol_no_ids, trojan_post_tls_sequence, trojan_post_tls_shape_sequence, or trojan_post_tls_merged", *modelFeatureSet))
+	}
+	if *modelFeatureSet == "trojan_post_tls_sequence" && len(selectedCols) != 30 {
+		fatal(fmt.Errorf("CSV %s 缺少 Trojan 后 TLS 载荷特征列；请使用新版 vpnflow 从 PCAP 重新生成特征", *csvPath))
+	}
+	if *modelFeatureSet == "trojan_post_tls_shape_sequence" && len(selectedCols) != 103 {
+		fatal(fmt.Errorf("CSV %s 缺少 Trojan 后 TLS 握手 shape_sequence 特征列；请使用新版 vpnflow 从 PCAP 重新生成特征", *csvPath))
+	}
+	if *modelFeatureSet == "trojan_post_tls_merged" && len(selectedCols) != 133 {
+		fatal(fmt.Errorf("CSV %s 缺少 Trojan 后 TLS 合并特征列（期望 133=30+103 去重并集）；请使用新版 vpnflow 从 PCAP 重新生成特征", *csvPath))
 	}
 	var b strings.Builder
 	p := func(format string, args ...any) {
@@ -98,9 +110,9 @@ func main() {
 	p("%s vs non-%s leak-free baseline", opts.positiveLabel, opts.positiveLabel)
 	p(strings.Repeat("=", 72))
 	p("rows=%d, positive=%d, negative=%d", len(ds.rows), countPos(ds.y), len(ds.rows)-countPos(ds.y))
-	p("training filter: packets>=%d duration>=%.2fs payload_bytes>=%d payload_pkts>=%d require_bidi=%v require_client_hello=%v require_tcp_handshake=%v",
+	p("training filter: packets>=%d duration>=%.2fs payload_bytes>=%d payload_pkts>=%d require_bidi=%v require_client_hello=%v require_post_tls_payload=%v require_tcp_handshake=%v",
 		opts.minPackets, opts.minDuration, opts.minPayloadBytes, opts.minPayloadPkts,
-		opts.requireBidi, opts.requireClientHello, opts.requireTCPHandshake)
+		opts.requireBidi, opts.requireClientHello, opts.requirePostTLSPayload, opts.requireTCPHandshake)
 	p("decision threshold: %.4f", decisionThreshold)
 	p("")
 	p("source distribution:")
@@ -117,10 +129,10 @@ func main() {
 	p("")
 	p("5-fold stratified by flow (optimistic; same source can appear in train/test)")
 	p(strings.Repeat("-", 72))
-	p("%-22s %6s %8s %8s %8s %8s %8s", "set", "feat", "F1", "AUC", "Prec", "Recall", "MeanP")
-	for _, name := range []string{"shape_core", "shape_sequence", "protocol_no_ids"} {
+	p("%-34s %6s %8s %8s %8s %8s %8s", "set", "feat", "F1", "AUC", "Prec", "Recall", "MeanP")
+	for _, name := range evaluationFeatureSetNames(sets) {
 		m := cvEval(ds, sets[name], 5)
-		p("%-22s %6d %8.4f %8.4f %8.4f %8.4f %8.4f", name, len(sets[name]), m.f1, m.auc, m.precision, m.recall, m.meanProb)
+		p("%-34s %6d %8.4f %8.4f %8.4f %8.4f %8.4f", name, len(sets[name]), m.f1, m.auc, m.precision, m.recall, m.meanProb)
 	}
 
 	if *externalPath != "" {
@@ -132,11 +144,11 @@ func main() {
 		p("External scoring: train on main CSV, score external CSV")
 		p(strings.Repeat("-", 72))
 		p("external rows=%d, positive=%d, negative=%d", len(ext.rows), countPos(ext.y), len(ext.rows)-countPos(ext.y))
-		p("%-22s %6s %8s %8s %8s %8s", "set", "feat", "F1", "AUC", "Prec", "Recall")
-		for _, name := range []string{"shape_core", "shape_sequence", "protocol_no_ids"} {
+		p("%-34s %6s %8s %8s %8s %8s", "set", "feat", "F1", "AUC", "Prec", "Recall")
+		for _, name := range evaluationFeatureSetNames(sets) {
 			probs := trainPredict(ds, ext, sets[name])
 			m := calcMetrics(ext.y, probs)
-			p("%-22s %6d %8.4f %8.4f %8.4f %8.4f  TP=%d FP=%d TN=%d FN=%d meanP=%.4f",
+			p("%-34s %6d %8.4f %8.4f %8.4f %8.4f  TP=%d FP=%d TN=%d FN=%d meanP=%.4f",
 				name, len(sets[name]), m.f1, m.auc, m.precision, m.recall, m.tp, m.fp, m.tn, m.fn, m.meanProb)
 		}
 		p("")
@@ -154,10 +166,10 @@ func main() {
 	p("")
 	p("Leave-one-source-out aggregate by feature set")
 	p(strings.Repeat("-", 72))
-	p("%-22s %6s %8s %8s %8s %8s %12s", "set", "feat", "F1", "AUC", "Prec", "Recall", "confusion")
-	for _, name := range []string{"shape_core", "shape_sequence", "protocol_no_ids"} {
+	p("%-34s %6s %8s %8s %8s %8s %12s", "set", "feat", "F1", "AUC", "Prec", "Recall", "confusion")
+	for _, name := range evaluationFeatureSetNames(sets) {
 		m := looAggregateEval(ds, sets[name])
-		p("%-22s %6d %8.4f %8.4f %8.4f %8.4f TP=%d FP=%d TN=%d FN=%d",
+		p("%-34s %6d %8.4f %8.4f %8.4f %8.4f TP=%d FP=%d TN=%d FN=%d",
 			name, len(sets[name]), m.f1, m.auc, m.precision, m.recall, m.tp, m.fp, m.tn, m.fn)
 	}
 
@@ -270,6 +282,9 @@ func readDataset(path string, opts readOptions) (dataset, error) {
 	if opts.requireTCPHandshake && !containsColumn(header, "tcp_handshake_complete") {
 		return dataset{}, fmt.Errorf("CSV %s 缺少 tcp_handshake_complete 列；请使用新版 vpnflow 从 PCAP 重新生成特征", path)
 	}
+	if opts.requirePostTLSPayload && !containsColumn(header, "post_tls_payload_ready") {
+		return dataset{}, fmt.Errorf("CSV %s 缺少 post_tls_payload_ready 列；请使用新版 vpnflow 从 PCAP 重新生成特征", path)
+	}
 	var rows []map[string]string
 	var y []int
 	for _, rec := range records[1:] {
@@ -317,6 +332,9 @@ func keepTrainingRow(row map[string]string, opts readOptions) bool {
 		return false
 	}
 	if opts.requireClientHello && parseInt(row["outer_client_hello_present"]) != 1 {
+		return false
+	}
+	if opts.requirePostTLSPayload && parseInt(row["post_tls_payload_ready"]) != 1 {
 		return false
 	}
 	if opts.requireTCPHandshake && parseInt(row["tcp_handshake_complete"]) != 1 {
@@ -376,6 +394,21 @@ func featureSets(header []string) map[string][]string {
 	}
 	seq = append(seq, "actual_payload_pkt_count")
 
+	postTLS := make([]string, 0, 30)
+	for i := 1; i <= 10; i++ {
+		postTLS = append(postTLS, fmt.Sprintf("post_tls_appdata_len_%d", i))
+	}
+	for i := 1; i <= 10; i++ {
+		postTLS = append(postTLS, fmt.Sprintf("post_tls_appdata_dir_%d", i))
+	}
+	for i := 1; i <= 10; i++ {
+		postTLS = append(postTLS, fmt.Sprintf("post_tls_appdata_iat_%d", i))
+	}
+	postTLSShape := make([]string, 0, len(seq))
+	for _, col := range seq {
+		postTLSShape = append(postTLSShape, "post_tls_shape_"+col)
+	}
+
 	proto := append([]string{}, seq...)
 	proto = append(proto,
 		"outer_client_hello_present", "outer_client_hello_size", "outer_tls_version",
@@ -398,10 +431,15 @@ func featureSets(header []string) map[string][]string {
 		}
 		return out
 	}
+	seqCols := filter(postTLS)
+	shapeCols := filter(postTLSShape)
 	return map[string][]string{
-		"shape_core":      filter(core),
-		"shape_sequence":  filter(seq),
-		"protocol_no_ids": filter(proto),
+		"shape_core":                     filter(core),
+		"shape_sequence":                 filter(seq),
+		"protocol_no_ids":                filter(proto),
+		"trojan_post_tls_sequence":       seqCols,
+		"trojan_post_tls_shape_sequence": shapeCols,
+		"trojan_post_tls_merged":         uniqueConcat(seqCols, shapeCols),
 	}
 }
 

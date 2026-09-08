@@ -36,6 +36,9 @@ type TLSRecord struct {
 	ContentType  uint8     // TLS Record Header 第 1 字节
 	Version      uint16    // TLS Record Header 第 2-3 字节（legacy_version）
 	RecordLength uint16    // TLS Record Header 第 4-5 字节（不含 5 字节头）
+	// HandshakeType 仅在未加密 Handshake Record 的首个消息可见时填写；
+	// 用于定位外层握手阶段，不作为模型特征。
+	HandshakeType uint8
 }
 
 // IsAppData 判断是否为 ApplicationData Record。

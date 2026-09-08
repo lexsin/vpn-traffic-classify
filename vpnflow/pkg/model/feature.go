@@ -13,6 +13,10 @@ type FeatureRow struct {
 	FlowKey    string
 	Label      string
 	Proto      string
+	// 标准协议规则结果是辅助路由/解释列，不进入 ML 特征集。
+	StandardProtocol        string
+	StandardProtocolVerdict string
+	ProtocolSessionID       string
 
 	// 五元组（定位用，绝不入模型）
 	SrcIP   net.IP
@@ -100,6 +104,19 @@ type FeatureRow struct {
 	InnerOffsetValue float64
 	InnerOffsetValid int
 
+	// —— Trojan 专用：外层 TLS 握手后的 AppData 序列 ——
+	// PostTLSPayloadReady 是质量辅助列，不进入模型。值为 1 表示已定位到
+	// 至少 3 条握手后的 AppData Record，可用于 Trojan 后载荷特征模型。
+	// TrojanApplicable 是推理硬门控，当前与 PostTLSPayloadReady 同口径。
+	TrojanApplicable          int
+	PostTLSPayloadReady       int
+	PostTLSActualAppDataCount int
+	PostTLSAppDataLen         [10]int
+	PostTLSAppDataDir         [10]int // 1=uplink, -1=downlink, 0=填充
+	PostTLSAppDataIAT         [10]float64
+	// PostTLSShape 与 shape_sequence 同口径，但只统计外层 TLS 握手完成后的包。
+	PostTLSShape PacketShape
+
 	// —— Phase 2: 前 10 包序列 ——
 	PktSize        [10]int
 	PktDir         [10]int // 1=uplink, -1=downlink, 0=填充
@@ -117,6 +134,7 @@ type FeatureRow struct {
 func CSVHeader() []string {
 	h := []string{
 		"source_file", "flow_key", "label", "proto",
+		"standard_protocol", "standard_protocol_verdict", "protocol_session_id",
 		"src_ip", "src_port", "dst_ip", "dst_port",
 		"flow_start_ts", "flow_end_ts", "flow_duration",
 		"total_packets", "total_payload_bytes",
@@ -143,7 +161,18 @@ func CSVHeader() []string {
 	h = append(h,
 		"first_uplink_appdata_size", "first_downlink_appdata_size", "first_appdata_ul_to_dl_ms",
 		"inner_hello_count", "inner_offset_value", "inner_offset_valid",
+		"trojan_applicable", "post_tls_payload_ready", "post_tls_actual_appdata_count",
 	)
+	for i := 1; i <= 10; i++ {
+		h = append(h, fmt.Sprintf("post_tls_appdata_len_%d", i))
+	}
+	for i := 1; i <= 10; i++ {
+		h = append(h, fmt.Sprintf("post_tls_appdata_dir_%d", i))
+	}
+	for i := 1; i <= 10; i++ {
+		h = append(h, fmt.Sprintf("post_tls_appdata_iat_%d", i))
+	}
+	h = append(h, packetShapeCSVHeader("post_tls_shape_")...)
 	for i := 1; i <= 10; i++ {
 		h = append(h, fmt.Sprintf("pkt_size_%d", i))
 	}
@@ -186,6 +215,7 @@ func (r FeatureRow) ToCSVRecord() []string {
 	}
 	out := []string{
 		r.SourceFile, r.FlowKey, r.Label, r.Proto,
+		r.StandardProtocol, r.StandardProtocolVerdict, r.ProtocolSessionID,
 		ipStr(r.SrcIP), fi(int(r.SrcPort)), ipStr(r.DstIP), fi(int(r.DstPort)),
 		ts(r.FlowStartTS), ts(r.FlowEndTS), ff(r.FlowDuration),
 		fi(r.TotalPackets), fi(r.TotalPayloadBytes),
@@ -212,7 +242,18 @@ func (r FeatureRow) ToCSVRecord() []string {
 	out = append(out,
 		fi(r.FirstUplinkAppDataSize), fi(r.FirstDownlinkAppDataSize), ff(r.FirstAppdataULToDLMs),
 		fi(r.InnerHelloCount), ff(r.InnerOffsetValue), fi(r.InnerOffsetValid),
+		fi(r.TrojanApplicable), fi(r.PostTLSPayloadReady), fi(r.PostTLSActualAppDataCount),
 	)
+	for i := 0; i < 10; i++ {
+		out = append(out, fi(r.PostTLSAppDataLen[i]))
+	}
+	for i := 0; i < 10; i++ {
+		out = append(out, fi(r.PostTLSAppDataDir[i]))
+	}
+	for i := 0; i < 10; i++ {
+		out = append(out, ff(r.PostTLSAppDataIAT[i]))
+	}
+	out = appendPacketShapeCSV(out, r.PostTLSShape)
 	for i := 0; i < 10; i++ {
 		out = append(out, fi(r.PktSize[i]))
 	}

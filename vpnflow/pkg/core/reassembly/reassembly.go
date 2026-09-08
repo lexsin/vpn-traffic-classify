@@ -273,6 +273,9 @@ func parseTLSRecords(flow *model.Flow, stream assembledStream, dir int) {
 
 		if rec.IsHandshake() {
 			hsPay := buf[offset+5 : offset+totalLen]
+			if len(hsPay) > 0 {
+				flow.Records[len(flow.Records)-1].HandshakeType = hsPay[0]
+			}
 			if dir == model.DirectionUplink && !clientHelloParsed &&
 				len(hsPay) > 0 && hsPay[0] == model.TLSHandshakeClientHello {
 				sni, sniLen := tlsparse.ParseClientHelloSNIWithValue(hsPay)
