@@ -12,6 +12,9 @@ const (
 	l2tpFlagLength   = 0x4000
 	l2tpFlagSequence = 0x0800
 	l2tpFlagOffset   = 0x0200
+	l2tpFlagPriority = 0x0100
+	// RFC 2661：T/L/S/O/P/Ver 之外的比特必须为 0。
+	l2tpReservedBits = 0x34F0
 )
 
 type l2tpMessage struct {
@@ -29,7 +32,16 @@ func (e *Engine) observeL2TP(pkt model.Packet, fs *flowState, dir model.FlowDire
 	if !ok {
 		return
 	}
-	s := e.session("l2tpv2", fs.key.String(), pkt, fs)
+	var s *sessionState
+	if msg.control {
+		s = e.session("l2tpv2", fs.key.String(), pkt, fs)
+	} else {
+		s = e.lookupSession("l2tpv2", fs.key.String())
+		if s == nil {
+			return
+		}
+		e.touchSession(s, pkt, fs.key.String())
+	}
 	s.l2tp.directions[directionIndex(dir)] = true
 	s.l2tp.tunnelIDs[msg.tunnelID] = struct{}{}
 	if msg.sessionID != 0 {
@@ -59,7 +71,18 @@ func parseL2TPv2(payload []byte) (l2tpMessage, bool) {
 	if flagsVersion&0x000f != 2 {
 		return l2tpMessage{}, false
 	}
+	if flagsVersion&l2tpReservedBits != 0 {
+		return l2tpMessage{}, false
+	}
 	control := flagsVersion&l2tpFlagType != 0
+	if control &&
+		(flagsVersion&l2tpFlagLength == 0 ||
+			flagsVersion&l2tpFlagSequence == 0 ||
+			flagsVersion&l2tpFlagOffset != 0 ||
+			flagsVersion&l2tpFlagPriority != 0) {
+		// RFC 2661：控制消息必须 T=1, L=1, S=1, O=0, P=0。
+		return l2tpMessage{}, false
+	}
 	pos := 2
 	end := len(payload)
 	if flagsVersion&l2tpFlagLength != 0 {
@@ -68,7 +91,7 @@ func parseL2TPv2(payload []byte) (l2tpMessage, bool) {
 		}
 		declared := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 		pos += 2
-		if declared < pos+4 || declared > len(payload) {
+		if declared != len(payload) || declared < pos+4 {
 			return l2tpMessage{}, false
 		}
 		end = declared
@@ -87,9 +110,6 @@ func parseL2TPv2(payload []byte) (l2tpMessage, bool) {
 			return l2tpMessage{}, false
 		}
 		pos += 4 // Ns, Nr
-	} else if control {
-		// L2TPv2 control messages must carry sequence numbers.
-		return l2tpMessage{}, false
 	}
 	if flagsVersion&l2tpFlagOffset != 0 {
 		if end < pos+2 {
@@ -103,6 +123,9 @@ func parseL2TPv2(payload []byte) (l2tpMessage, bool) {
 		pos += offsetSize
 	}
 	if !control {
+		if msg.tunnelID == 0 || msg.sessionID == 0 {
+			return l2tpMessage{}, false
+		}
 		return msg, true
 	}
 	if msg.sessionID != 0 {

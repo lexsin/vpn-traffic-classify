@@ -49,17 +49,18 @@ type flowState struct {
 }
 
 type sessionState struct {
-	id         string
-	indexKey   string
-	protocol   string
-	sourceFile string
-	firstSeen  time.Time
-	lastSeen   time.Time
-	generation uint64
-	client     string
-	server     string
-	flows      map[string]struct{}
-	evidence   map[string]struct{}
+	id            string
+	indexKey      string
+	protocol      string
+	sourceFile    string
+	firstSeen     time.Time
+	lastSeen      time.Time
+	generation    uint64
+	client        string
+	server        string
+	flows         map[string]struct{}
+	evidence      map[string]struct{}
+	wellKnownPort bool
 
 	openvpn openVPNSession
 	pptp    pptpSession
@@ -81,10 +82,18 @@ type openVPNSession struct {
 }
 
 type pptpSession struct {
-	controlPackets int
-	callIDs        map[uint16]struct{}
-	greCallIDs     map[uint16]struct{}
-	matchedGRE     bool
+	controlPackets    int
+	callIDs           map[uint16]struct{}
+	greCallIDs        map[uint16]struct{}
+	matchedGRE        bool
+	sccRequest        bool
+	sccReply          bool
+	sccRequestDir     uint8 // direction index + 1；0 表示未知
+	sccReplyDir       uint8
+	outCallRequest    bool
+	outCallReply      bool
+	outCallRequestDir uint8
+	outCallReplyDir   uint8
 }
 
 type l2tpSession struct {
@@ -173,19 +182,24 @@ func (e *Engine) FlushAll() []model.ProtocolResult {
 	return results
 }
 
+func (e *Engine) lookupSession(protocol, index string) *sessionState {
+	if id := e.active[protocol+"|"+index]; id != "" {
+		return e.sessions[id]
+	}
+	return nil
+}
+
 func (e *Engine) session(protocol, index string, pkt model.Packet, fs *flowState) *sessionState {
-	activeKey := protocol + "|" + index
-	if id := e.active[activeKey]; id != "" {
-		if s := e.sessions[id]; s != nil {
-			e.touchSession(s, pkt.Timestamp, fs.key.String())
-			return s
-		}
+	if s := e.lookupSession(protocol, index); s != nil {
+		e.touchSession(s, pkt, fs.key.String())
+		return s
 	}
 	e.nextSessionID++
 	sourceID := e.cfg.SourceFile
 	if sourceID == "" {
 		sourceID = "stream"
 	}
+	activeKey := protocol + "|" + index
 	id := fmt.Sprintf(
 		"%s:%s:%x:%x",
 		protocol,
@@ -210,11 +224,12 @@ func (e *Engine) session(protocol, index string, pkt model.Packet, fs *flowState
 	s.wg.respSenders = make(map[uint32]struct{})
 	e.sessions[id] = s
 	e.active[activeKey] = id
-	e.touchSession(s, pkt.Timestamp, fs.key.String())
+	e.touchSession(s, pkt, fs.key.String())
 	return s
 }
 
-func (e *Engine) touchSession(s *sessionState, ts time.Time, flowKey string) {
+func (e *Engine) touchSession(s *sessionState, pkt model.Packet, flowKey string) {
+	ts := pkt.Timestamp
 	if s.firstSeen.IsZero() || ts.Before(s.firstSeen) {
 		s.firstSeen = ts
 	}
@@ -222,10 +237,28 @@ func (e *Engine) touchSession(s *sessionState, ts time.Time, flowKey string) {
 		s.lastSeen = ts
 	}
 	s.flows[flowKey] = struct{}{}
+	if wellKnownPortMatch(s.protocol, pkt) {
+		s.wellKnownPort = true
+	}
 	s.generation++
 	heap.Push(&e.sessionExpiry, sessionExpiryItem{
 		id: s.id, at: ts.Add(e.cfg.IdleTimeout), generation: s.generation,
 	})
+}
+
+func wellKnownPortMatch(protocol string, pkt model.Packet) bool {
+	switch protocol {
+	case "pptp":
+		return pkt.IsTCP() && (pkt.SrcPort == 1723 || pkt.DstPort == 1723)
+	case "l2tpv2":
+		return pkt.IsUDP() && (pkt.SrcPort == 1701 || pkt.DstPort == 1701)
+	case "openvpn":
+		return (pkt.IsTCP() || pkt.IsUDP()) && (pkt.SrcPort == 1194 || pkt.DstPort == 1194)
+	case "wireguard":
+		return pkt.IsUDP() && (pkt.SrcPort == 51820 || pkt.DstPort == 51820)
+	default:
+		return false
+	}
 }
 
 func (s *sessionState) addEvidence(values ...string) {
@@ -295,9 +328,18 @@ func (e *Engine) finalizeSession(id string) (model.ProtocolResult, bool) {
 	if e.active[s.indexKey] == id {
 		delete(e.active, s.indexKey)
 	}
-	confirmed := s.confirmed()
 	if len(s.evidence) == 0 {
 		return model.ProtocolResult{}, false
+	}
+	// 仅数据面头看起来像 L2TPv2 不足以输出会话，避免 HY2/随机 UDP 误报。
+	if s.protocol == "l2tpv2" && s.l2tp.controlPackets == 0 {
+		return model.ProtocolResult{}, false
+	}
+	confirmed := s.confirmed()
+	if s.wellKnownPort {
+		s.addEvidence("well_known_port")
+		// 已有 payload 证据的 suspected，命中标准端口则升为 confirmed。
+		confirmed = true
 	}
 	verdict := model.VerdictSuspected
 	confidence := 0.60
@@ -334,7 +376,8 @@ func (s *sessionState) confirmed() bool {
 			(s.openvpn.consistentControl[0] >= 2 ||
 				s.openvpn.consistentControl[1] >= 2)
 	case "pptp":
-		return s.pptp.controlPackets > 0 && s.pptp.matchedGRE
+		// 控制面双关即可确认；GRE Call-ID 匹配是更强证据，但不再作为必要条件。
+		return s.pptp.matchedGRE || s.pptp.sccHandshake() || s.pptp.outgoingCallHandshake()
 	case "l2tpv2":
 		return s.l2tp.controlPackets >= 2 ||
 			(s.l2tp.controlPackets >= 1 && s.l2tp.dataPackets >= 1)

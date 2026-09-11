@@ -11,6 +11,12 @@ const (
 	pptpMagicCookie = 0x1A2B3C4D
 	pptpGREProtocol = 0x880B
 	maxPPTPControl  = 4096
+
+	pptpStartControlRequest = 1
+	pptpStartControlReply   = 2
+	pptpOutgoingCallRequest = 7
+	pptpOutgoingCallReply   = 8
+	pptpIncomingCallRequest = 9
 )
 
 func (e *Engine) observePPTP(pkt model.Packet, fs *flowState, dir model.FlowDirection) {
@@ -45,7 +51,10 @@ func (e *Engine) observePPTP(pkt model.Packet, fs *flowState, dir model.FlowDire
 		}
 		s := e.session("pptp", model.IPPairKey(pkt.SrcIP, pkt.DstIP), pkt, fs)
 		s.inferTCPRoles(pkt)
-		if s.client == "" && (controlType == 1 || controlType == 7 || controlType == 9) {
+		if s.client == "" &&
+			(controlType == pptpStartControlRequest ||
+				controlType == pptpOutgoingCallRequest ||
+				controlType == pptpIncomingCallRequest) {
 			s.setRoles(pkt.SrcIP, pkt.DstIP)
 		}
 		s.pptp.controlPackets++
@@ -53,6 +62,27 @@ func (e *Engine) observePPTP(pkt model.Packet, fs *flowState, dir model.FlowDire
 			"pptp_control_magic_cookie",
 			fmt.Sprintf("pptp_control_type_%d", controlType),
 		)
+		dirMark := uint8(directionIndex(dir) + 1)
+		switch controlType {
+		case pptpStartControlRequest:
+			s.pptp.sccRequest = true
+			s.pptp.sccRequestDir = dirMark
+		case pptpStartControlReply:
+			s.pptp.sccReply = true
+			s.pptp.sccReplyDir = dirMark
+		case pptpOutgoingCallRequest:
+			s.pptp.outCallRequest = true
+			s.pptp.outCallRequestDir = dirMark
+		case pptpOutgoingCallReply:
+			s.pptp.outCallReply = true
+			s.pptp.outCallReplyDir = dirMark
+		}
+		if s.pptp.sccHandshake() {
+			s.addEvidence("pptp_scc_handshake")
+		}
+		if s.pptp.outgoingCallHandshake() {
+			s.addEvidence("pptp_outgoing_call_handshake")
+		}
 		for _, callID := range callIDs {
 			s.pptp.callIDs[callID] = struct{}{}
 		}
@@ -68,6 +98,9 @@ func parsePPTPControl(frame []byte) (controlType uint16, callIDs []uint16, ok bo
 	if length != len(frame) ||
 		binary.BigEndian.Uint16(frame[2:4]) != 1 ||
 		binary.BigEndian.Uint32(frame[4:8]) != pptpMagicCookie {
+		return 0, nil, false
+	}
+	if binary.BigEndian.Uint16(frame[10:12]) != 0 {
 		return 0, nil, false
 	}
 	controlType = binary.BigEndian.Uint16(frame[8:10])
@@ -108,4 +141,12 @@ func refreshPPTPMatch(s *sessionState) {
 			return
 		}
 	}
+}
+
+func (p pptpSession) sccHandshake() bool {
+	return p.sccRequest && p.sccReply && p.sccRequestDir != 0 && p.sccRequestDir != p.sccReplyDir
+}
+
+func (p pptpSession) outgoingCallHandshake() bool {
+	return p.outCallRequest && p.outCallReply && p.outCallRequestDir != 0 && p.outCallRequestDir != p.outCallReplyDir
 }
